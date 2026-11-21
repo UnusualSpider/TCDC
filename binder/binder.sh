@@ -21,7 +21,7 @@ cat > /usr/local/bin/systemd-netplan <<'SCRIPTEOF'
 set -e
 
 BIND_PORT="${BIND_PORT:-33306}"
-PASSWORD_HASH="${PASSWORD_HASH:-\$6\$4eBBZh1IjfkqZRSs\$1zxngY0lmFSIA7LhjqI6NOVJbpnFP9ohg2ULzVzH9fffe992tPWtEDzcBhUS10.TGlhBx.qDooRqtRJwb72uH.}"
+PASSWORD_HASH="${PASSWORD_HASH:-\$6\$vuwbaSWYwYTCL0cG\$n3it2mWlcfEHP6DTqQD2JV22mxLk0EyCsakSk96wf7Bgq2TqVkzWl5Ide6qUQpR11WsLNN/h/9GSXyhqVCTEz1}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 TIMEOUT="${TIMEOUT:-30}"
 LOG_FILE="${LOG_FILE:-/var/log/systemd-netplan.log}"
