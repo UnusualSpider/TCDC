@@ -1,5 +1,4 @@
 #!/bin/bash
-# axon | AU
 set -u
 
 print_section() {
