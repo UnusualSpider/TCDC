@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Watchdog Installer - Sets up ALL persistence mechanisms
-# axon | AU
 set -euo pipefail
 
 need_root() {
